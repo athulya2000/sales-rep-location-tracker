@@ -4,39 +4,6 @@ A high-performance Laravel 12 application designed to ingest, process, and query
 
 ---
 
-## Technical Overview & Architecture
-
-```mermaid
-flowchart TD
-    subgraph Mobile Devices
-        MD[Field Rep Mobile App]
-        LB[Local SQLite Buffer]
-        MD -->|Continuous GPS 10-30s| LB
-        LB -->|POST /api/v1/locations/batch| ING[LocationBatchController]
-    end
-
-    subgraph Ingestion & Storage
-        ING -->|Validate| REQ[StoreLocationBatchRequest]
-        ING -->|insertOrIgnore chunks| REPO[LocationPointRepository]
-        REPO --> DB_RAW[(MySQL: location_points)]
-        ING -->|HTTP 202 + Dispatch| Q[(Database Queue)]
-    end
-
-    subgraph Background Processing
-        Q --> W[Queue Worker]
-        W --> CSJ[ComputeStopsJob]
-        CSJ --> SD[StopDetector Engine]
-        SD -->|Precomputed Stops| DB_STOPS[(MySQL: stops)]
-    end
-
-    subgraph Query Endpoints
-        SRC[StopReportController] -->|Read Precomputed / On-Demand| DB_STOPS
-        ZRC[ZoneReportController] -->|1. Bounding Box Index Filter| DB_RAW
-        ZRC -->|2. Ray Casting Dwell Time| ZA[ZoneAnalyzer Engine]
-        DVC[RepDayViewController] -->|RDP Simplification| TS[TrackSimplifier]
-        DVC --> MAP[Leaflet + OSM Interactive Map]
-    end
-```
 
 ### Architecture Highlights
 1. **Thin Controller Pattern**: All controllers validate via Form Requests, delegate business logic to domain services (`StopDetector`, `ZoneAnalyzer`, `TrackSimplifier`) and repositories, and return typed API Resources.
@@ -67,7 +34,7 @@ flowchart TD
 
 ### Optional: MySQL Partitioning by Range
 For high-volume enterprise deployments, `location_points` can be partitioned by date:
-```sql
+
 -- In MySQL, every UNIQUE key must contain the partition column:
 ALTER TABLE location_points DROP PRIMARY KEY, DROP INDEX location_points_rep_id_recorded_at_unique;
 
@@ -80,7 +47,7 @@ ALTER TABLE location_points PARTITION BY RANGE COLUMNS(recorded_date) (
     PARTITION p_2026_10_19 VALUES LESS THAN ('2026-10-20'),
     PARTITION p_future VALUES LESS THAN (MAXVALUE)
 );
-```
+
 
 ---
 
@@ -116,7 +83,7 @@ All API routes are prefixed under `/api/v1` and require the `Accept: application
 * **Route**: `/api/v1/locations/batch`
 * **Status**: `202 Accepted`
 
-```bash
+
 curl -X POST http://127.0.0.1:8000/api/v1/locations/batch \
   -H "Accept: application/json" \
   -H "Content-Type: application/json" \
@@ -137,16 +104,16 @@ curl -X POST http://127.0.0.1:8000/api/v1/locations/batch \
       }
     ]
   }'
-```
+
 
 **Response (202 Accepted):**
-```json
+json
 {
   "accepted": 2,
   "inserted": 2,
   "duplicates": 0
 }
-```
+
 
 ---
 
@@ -155,13 +122,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/locations/batch \
 * **Route**: `/api/v1/reps/{rep}/stops?date=YYYY-MM-DD`
 * **Status**: `200 OK` (or `404 Not Found` if rep does not exist, `422` if date invalid)
 
-```bash
+
 curl -X GET "http://127.0.0.1:8000/api/v1/reps/1/stops?date=2026-10-18" \
   -H "Accept: application/json"
-```
+
 
 **Response (200 OK):**
-```json
+json
 {
   "rep_id": 1,
   "date": "2026-10-18",
@@ -176,7 +143,7 @@ curl -X GET "http://127.0.0.1:8000/api/v1/reps/1/stops?date=2026-10-18" \
     }
   ]
 }
-```
+
 
 ---
 
@@ -185,14 +152,14 @@ curl -X GET "http://127.0.0.1:8000/api/v1/reps/1/stops?date=2026-10-18" \
 * **Route**: `/api/v1/zones/reps?date=YYYY-MM-DD&coordinates=[[lat,lng],...]`
 * **Status**: `200 OK`
 
-```bash
+
 curl -G -H "Accept: application/json" "http://127.0.0.1:8000/api/v1/zones/reps" \
   --data-urlencode "date=2026-10-18" \
   --data-urlencode 'coordinates=[[11.050,76.068],[11.058,76.068],[11.058,76.078],[11.050,76.078]]'
-```
+
 
 **Response (200 OK):**
-```json
+json
 {
   "data": [
     {
@@ -209,7 +176,7 @@ curl -G -H "Accept: application/json" "http://127.0.0.1:8000/api/v1/zones/reps" 
     }
   ]
 }
-```
+
 
 ---
 
@@ -231,7 +198,7 @@ curl -G -H "Accept: application/json" "http://127.0.0.1:8000/api/v1/zones/reps" 
 - MySQL 8.0+
 
 ### Setup Commands
-```bash
+
 # 1. Install dependencies
 composer install
 
@@ -251,26 +218,25 @@ php artisan queue:work
 # 6. Start the local development server
 php artisan serve
 # Open http://localhost:8000 in your browser
-```
+
 
 ### Running Tests
 All unit and feature tests use in-memory SQLite and require no manual test database configuration:
-```bash
+
 php artisan test
-```
+
 
 ### Code Formatting (Laravel Pint)
-```bash
+
 ./vendor/bin/pint --test
-```
+
 
 ### Generating Realistic Shifts (Artisan Simulator)
-```bash
+
 php artisan tracking:simulate {rep_id_or_name} {YYYY-MM-DD}
 
 # Example:
 php artisan tracking:simulate 1 2026-10-18
-```
 
 ---
 
