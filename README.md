@@ -1,133 +1,77 @@
 # Sales Representative Location Tracking System
 
-A high-throughput, fault-tolerant geospatial tracking backend built with **PHP 8.2+** and **Laravel 12**. The system ingests continuous GPS streams from mobile devices carried by field sales representatives, provides zero-data-loss guarantees, computes stationary stop reports, evaluates polygon zone dwell times, and serves an interactive Leaflet + OpenStreetMap daily tracking playback.
+A high-performance Laravel 12 application designed to ingest, process, and query continuous GPS location streams for field sales representatives with **zero data loss**, optimized storage, and sub-second query latency.
 
 ---
 
-## 1. System Architecture
+## Technical Overview & Architecture
 
 ```mermaid
 flowchart TD
     subgraph Mobile Devices
         MD[Field Rep Mobile App]
         LB[Local SQLite Buffer]
-        MD -->|Continuous GPS (10-30s)| LB
-        LB -->|Bulk HTTP POST /api/v1/locations/batch| ING
+        MD -->|Continuous GPS 10-30s| LB
+        LB -->|POST /api/v1/locations/batch| ING[LocationBatchController]
     end
 
-    subgraph Ingestion Layer
-        ING[LocationBatchController]
-        REQ[StoreLocationBatchRequest]
-        REP[LocationPointRepository]
-        ING -->|Validate| REQ
-        ING -->|insertOrIgnore chunks| REP
-        REP -->|Raw Points Table| DB_RAW[(MySQL location_points)]
-        ING -->|202 Accepted + Dispatch| Q[(Database Queue)]
+    subgraph Ingestion & Storage
+        ING -->|Validate| REQ[StoreLocationBatchRequest]
+        ING -->|insertOrIgnore chunks| REPO[LocationPointRepository]
+        REPO --> DB_RAW[(MySQL: location_points)]
+        ING -->|HTTP 202 + Dispatch| Q[(Database Queue)]
     end
 
-    subgraph Async Processing
+    subgraph Background Processing
         Q --> W[Queue Worker]
         W --> CSJ[ComputeStopsJob]
-        CSJ --> REP
         CSJ --> SD[StopDetector Engine]
-        SD -->|Precomputed Stops| DB_STOPS[(MySQL stops)]
+        SD -->|Precomputed Stops| DB_STOPS[(MySQL: stops)]
     end
 
-    subgraph Query & Analytics Layer
-        SRC[StopReportController]
-        ZRC[ZoneReportController]
-        DVC[RepDayViewController]
-        
-        SRC -->|Read Precomputed / On-Demand| DB_STOPS
-        ZRC -->|Step 1: BBox Index Filter| DB_RAW
-        ZRC -->|Step 2: Stream Full Day Points| ZA[ZoneAnalyzer Engine]
-        DVC -->|Ramer-Douglas-Peucker| TS[TrackSimplifier]
-        DVC -->|Render| MAP[Leaflet + OSM Playback Map]
+    subgraph Query Endpoints
+        SRC[StopReportController] -->|Read Precomputed / On-Demand| DB_STOPS
+        ZRC[ZoneReportController] -->|1. Bounding Box Index Filter| DB_RAW
+        ZRC -->|2. Ray Casting Dwell Time| ZA[ZoneAnalyzer Engine]
+        DVC[RepDayViewController] -->|RDP Simplification| TS[TrackSimplifier]
+        DVC --> MAP[Leaflet + OSM Interactive Map]
     end
 ```
 
-### Architectural Highlights
-- **At-Least-Once Delivery & Idempotency**: The mobile client stores GPS points in a local database and only purges them after a successful `202 Accepted` response. If a network blip occurs, the device resends the batch. The server applies MySQL `INSERT IGNORE` with a unique constraint on `(rep_id, recorded_at)`, rendering duplicate submissions completely safe and idempotent.
-- **Decoupled Ingestion & Computation**: Ingestion is synchronous and lightning-fast (bulk batch inserts). Stop detection runs asynchronously via queued background jobs (`ComputeStopsJob`), keeping API response latencies minimal (<30ms).
-- **Two-Tier Query Strategy**: Read endpoints utilize precomputed tables where possible, while falling back to real-time streaming computation if requested for current/unprocessed days.
+### Architecture Highlights
+1. **Thin Controller Pattern**: All controllers validate via Form Requests, delegate business logic to domain services (`StopDetector`, `ZoneAnalyzer`, `TrackSimplifier`) and repositories, and return typed API Resources.
+2. **Asynchronous Background Processing**: Ingestion returns immediately with `HTTP 202 Accepted` after writing raw data. The heavy calculation of stationary stops is dispatched to background queued jobs (`ComputeStopsJob`), keeping mobile app API latency $< 30\text{ms}$.
+3. **Dual Read Strategy**: The Stop Report reads precomputed stops from the indexed `stops` table for $O(1)$ lookups. If stops have not yet been processed by the queue worker, it falls back to real-time calculation from raw points on demand.
 
 ---
 
-## 2. Data Model & Index Design
+## Balancing Zero Data Loss with Storage Optimization
 
-```mermaid
-erDiagram
-    reps ||--o{ location_points : "has many (cascade)"
-    reps ||--o{ stops : "has many (cascade)"
+### 1. Guaranteeing Zero Data Loss
+* **Local Device Buffering & At-Least-Once Delivery**: The mobile application writes points to local storage first and deletes them only upon receiving an HTTP 202 response from the server.
+* **Server-Side Idempotency**: The `location_points` table enforces a composite unique constraint on `(rep_id, recorded_at)`. Ingestion uses `DB::table()->insertOrIgnore()`. If network instability causes the mobile device to resend the batch, duplicate points are safely ignored without throwing database errors or creating duplicate rows.
+* **No Premature Downsampling**: Raw GPS points are never downsampled or dropped upon ingestion. Every point sent by the mobile device is persisted.
 
-    reps {
-        bigint id PK
-        string name
-        datetime created_at
-        datetime updated_at
-    }
-
-    location_points {
-        bigint id PK
-        bigint rep_id FK
-        datetime recorded_at "UTC timestamp"
-        date recorded_date "Denormalized for partitioning & indexing"
-        decimal lat "DECIMAL(9,6)"
-        decimal lng "DECIMAL(9,6)"
-        smallint accuracy "Meters, nullable"
-    }
-
-    stops {
-        bigint id PK
-        bigint rep_id FK
-        date date "Shift date"
-        decimal lat "DECIMAL(9,6) centroid"
-        decimal lng "DECIMAL(9,6) centroid"
-        datetime started_at "Cluster arrival"
-        datetime ended_at "Cluster departure"
-        int duration_seconds "Total stationary seconds"
-    }
-```
-
-### Rationale for Schema Design
-1. **`location_points` Storage Optimization**:
-   - `lat` and `lng` use `DECIMAL(9,6)`: Provides precision down to ~0.11 meters (11 cm), perfectly suited for walking street-level accuracy while consuming only 5 bytes per coordinate (10 bytes total), compared to 16 bytes for `DOUBLE`.
-   - `recorded_date` (DATE): Denormalized from `recorded_at` to eliminate expensive runtime date functions (e.g., `DATE(recorded_at)` prevents index usage).
-   - No `created_at` / `updated_at`: Omission of standard Laravel timestamps saves 16 bytes per row. For 10 million rows, this directly saves ~160 MB of storage and index overhead.
-   - `accuracy` (UNSIGNED SMALLINT): 2 bytes, tracks GPS accuracy in meters.
-2. **Indexing Strategy**:
-   - `UNIQUE(rep_id, recorded_at)`: Enforces idempotency for re-sent device payloads and prevents duplication.
-   - `INDEX(rep_id, recorded_date, recorded_at)`: Enables instant range scans for daily rep tracks, chronological order queries, and streaming cursor pagination.
-   - `INDEX(recorded_date, lat, lng)`: Crucial for the Zone Report. Filters potential candidates inside a rectangular bounding box using a compound B-Tree index before executing detailed ray-casting algorithms.
-3. **`stops` Derived Table**:
-   - `INDEX(rep_id, date)`: Instant $O(1)$ lookup for daily Stop Reports without scanning millions of raw points.
-   - `UNIQUE(rep_id, started_at)`: Prevents duplicate stop records upon job retries.
-
----
-
-## 3. Zero Data Loss vs. Storage Optimization
-
-Balancing uninterrupted fidelity (zero data loss) with high-volume geographical storage demands a multi-tiered data lifecycle:
-
-| Concern | Implementation in System |
-| :--- | :--- |
-| **Zero Data Loss** | Mobile client local storage + retry with exponential backoff; Server uses `insertOrIgnore` on `UNIQUE(rep_id, recorded_at)`. No point is ever dropped or downsampled upon ingestion. |
-| **Row Density** | Compact native data types (`DECIMAL(9,6)`, `SMALLINT`, `DATE`), elimination of redundant framework timestamps, resulting in ~35-40 bytes per raw point on disk. |
-| **Query Acceleration** | Pre-filtering candidate sales reps through spatial bounding boxes using composite indexes `(recorded_date, lat, lng)` before CPU-intensive polygon math. |
-| **Memory Efficiency** | Streaming queries via Laravel `LazyCollection` (`cursor()`) ensure constant memory footprint ($O(1)$ RAM) even when processing millions of coordinate points. |
-| **Derived Caching** | High-level business events (e.g., stationary stops) are materialized into the `stops` table so read queries don't re-calculate raw geometry. |
-| **Track Simplification** | For map visualizations, the Ramer-Douglas-Peucker (RDP) algorithm compresses displayed track vertices by **~75-90%**, preserving bandwidth and browser rendering speed while retaining exact stops and sharp turns. |
+### 2. Storage & Query Optimization
+* **Space-Efficient Column Types**:
+  * Coordinates use `DECIMAL(9,6)`, providing precision down to ~11 cm while requiring only 5 bytes per coordinate (10 bytes total), compared to 16 bytes for `DOUBLE`.
+  * `accuracy` is stored as `UNSIGNED SMALLINT` (2 bytes).
+  * Removed Laravel's standard `created_at` and `updated_at` timestamps on `location_points`, saving 16 bytes per row. Over 10 million points, this directly saves **160 MB** of disk space and index overhead.
+* **Denormalized Partition & Search Key (`recorded_date`)**:
+  * Storing `recorded_date` (DATE) prevents the need for runtime SQL functions like `DATE(recorded_at)`, which would invalidate B-Tree index scans.
+* **Composite Indexes**:
+  * `(rep_id, recorded_date, recorded_at)`: Accelerates single-rep daily queries, chronological order scans, and streaming cursors.
+  * `(recorded_date, lat, lng)`: Enables fast 2D rectangular bounding box pre-filtering for zone queries before running CPU-intensive ray-casting algorithms.
+* **Memory-Safe Streaming (`lazy()` / `cursor()`)**: All point processing runs in constant memory ($O(1)$ RAM) via Laravel `LazyCollection`, preventing PHP memory exhaustion when handling millions of points.
+* **Map Display Track Simplification**: The Ramer-Douglas-Peucker (RDP) algorithm in `TrackSimplifier` reduces polyline points by **~80%** before rendering the Leaflet web map, drastically decreasing browser DOM nodes and payload bandwidth.
 
 ### Optional: MySQL Partitioning by Range
-In high-volume enterprise production deployments (e.g., millions of points per week), MySQL table partitioning by `recorded_date` allows instant partition drops for data retention and partition pruning for queries:
-
+For high-volume enterprise deployments, `location_points` can be partitioned by date:
 ```sql
--- NOTE: In MySQL, every UNIQUE key must include the partition column.
--- To partition location_points, modify the primary and unique keys as follows:
-
+-- In MySQL, every UNIQUE key must contain the partition column:
 ALTER TABLE location_points DROP PRIMARY KEY, DROP INDEX location_points_rep_id_recorded_at_unique;
 
-ALTER TABLE location_points 
+ALTER TABLE location_points
     ADD PRIMARY KEY (id, recorded_date),
     ADD UNIQUE KEY location_points_rep_date_time_unique (rep_id, recorded_date, recorded_at);
 
@@ -138,52 +82,44 @@ ALTER TABLE location_points PARTITION BY RANGE COLUMNS(recorded_date) (
 );
 ```
 
-### Cold Storage & Archival Policy
-Raw points older than 90 days can be exported to Parquet/ORC files and archived to Amazon S3 Glacier. Because `stops` are precomputed and preserved, operational stop reporting remains unaffected indefinitely.
+---
+
+## Algorithms
+
+1. **Stop Detection (`StopDetector`)**:
+   * Uses a sliding **distance-from-anchor clustering** algorithm.
+   * Cluster starts at anchor $P_0$. For each subsequent point $P_i$, great-circle distance $d = \text{haversine}(P_0, P_i)$ is computed.
+   * If $d \le 50\text{ meters}$, $P_i$ extends the cluster.
+   * If $d > 50\text{ meters}$ (or time gap $> 1800\text{s}$), the cluster closes. If duration $\ge 900\text{ seconds}$ (15 minutes), a stop is emitted with the centroid average coordinates. A new cluster starts at $P_i$.
+   * A short 10-minute coffee pause correctly does **not** qualify as a stop.
+
+2. **Point-in-Polygon (`Geo::pointInPolygon`)**:
+   * Implements the **Jordan Curve Theorem (Ray Casting)** algorithm to determine if a point is inside an arbitrary polygon with $\ge 3$ vertices.
+   * Accurately handles edge and vertex intersections.
+
+3. **Zone Dwell Time (`ZoneAnalyzer`)**:
+   * For consecutive chronological points $A \rightarrow B$, if $A$ is inside the polygon, the duration $(B.\text{time} - A.\text{time})$ is added.
+   * To prevent device power-offs or signal outages inside a zone from exaggerating dwell time, each interval is capped at `zone_gap_cap_seconds` (default: 300 seconds).
+   * Representatives with 0 seconds in the zone are excluded.
+
+4. **Track Simplification (`TrackSimplifier`)**:
+   * Implements the **Ramer-Douglas-Peucker (RDP)** algorithm. Recursively removes intermediate coordinates whose perpendicular distance to the segment line is less than $\epsilon$ (`rdp_tolerance`), preserving sharp corners and segment endpoints.
 
 ---
 
-## 4. Algorithms
+## API Documentation
 
-### 1. Stationary Stop Detection (Distance-From-Anchor Clustering)
-- **Algorithm**: A sliding centroid-anchor window.
-- The cluster begins anchored at point $P_0$.
-- For every consecutive point $P_i$, great-circle distance $d = \text{haversine}(P_0, P_i)$ is computed.
-- If $d \le 50\text{ meters}$, $P_i$ extends the current cluster.
-- If $d > 50\text{ meters}$ (or time gap $> 1800\text{s}$), the cluster is evaluated:
-  - If $(\text{time}(P_{i-1}) - \text{time}(P_0)) \ge 900\text{ seconds}$ (15 minutes), a stop is emitted with the centroid (average lat/lng) and exact duration.
-  - A new cluster is then initialized with $P_i$ as the new anchor.
-- Handles edge cases: single points, 10-minute pauses (correctly excluded), and sensor noise jitter.
+All API routes are prefixed under `/api/v1` and require the `Accept: application/json` header.
 
-### 2. Point-in-Polygon (Jordan Curve Theorem / Ray Casting)
-- Determines if coordinate $(lat, lng)$ lies inside an arbitrary polygon with $\ge 3$ vertices.
-- Casts a horizontal ray along the longitude axis and counts edge intersections. If intersection count is odd, the point is strictly inside.
-- Explicitly handles vertices and boundary edges.
+### 1. Ingest Location Batch
+* **Method**: `POST`
+* **Route**: `/api/v1/locations/batch`
+* **Status**: `202 Accepted`
 
-### 3. Time in Zone Calculation with Outage Capping
-- Iterates chronologically through candidate points $P_1, P_2, \dots, P_n$.
-- If $P_i$ is inside the polygon, the interval $\Delta t = \text{time}(P_{i+1}) - \text{time}(P_i)$ is accumulated.
-- To prevent network outages or power-offs inside a zone from falsely reporting hundreds of hours, each interval is clamped:
-  $$\text{Interval Duration} = \min(\Delta t, \text{zone\_gap\_cap\_seconds})$$
-- Reps with zero total time are excluded.
-
-### 4. Ramer-Douglas-Peucker (RDP) Track Simplification
-- Recursively simplifies a polygonal curve by discarding points whose perpendicular distance to the line between segment endpoints is less than $\epsilon$ (`rdp_tolerance`).
-- Guarantees endpoints are retained and curves with significant deviation are preserved.
-
----
-
-## 5. API Documentation & Examples
-
-### 1. Bulk Ingest Location Batch
-- **Endpoint**: `POST /api/v1/locations/batch`
-- **Status Code**: `202 Accepted`
-
-#### Example Request
 ```bash
-curl -X POST http://localhost:8000/api/v1/locations/batch \
-  -H "Content-Type: application/json" \
+curl -X POST http://127.0.0.1:8000/api/v1/locations/batch \
   -H "Accept: application/json" \
+  -H "Content-Type: application/json" \
   -d '{
     "rep_id": 1,
     "points": [
@@ -195,7 +131,7 @@ curl -X POST http://localhost:8000/api/v1/locations/batch \
       },
       {
         "lat": 11.051250,
-        "lng": 76.071250,
+        "lng": 76.071240,
         "recorded_at": "2026-10-18T09:00:15Z",
         "accuracy": 4
       }
@@ -203,7 +139,7 @@ curl -X POST http://localhost:8000/api/v1/locations/batch \
   }'
 ```
 
-#### Example Response
+**Response (202 Accepted):**
 ```json
 {
   "accepted": 2,
@@ -214,25 +150,25 @@ curl -X POST http://localhost:8000/api/v1/locations/batch \
 
 ---
 
-### 2. Retrieve Stop Report for Representative
-- **Endpoint**: `GET /api/v1/reps/{rep}/stops?date=YYYY-MM-DD`
-- **Status Code**: `200 OK` (or `404 Not Found` if rep does not exist, `422` if date invalid)
+### 2. Stop Report
+* **Method**: `GET`
+* **Route**: `/api/v1/reps/{rep}/stops?date=YYYY-MM-DD`
+* **Status**: `200 OK` (or `404 Not Found` if rep does not exist, `422` if date invalid)
 
-#### Example Request
 ```bash
-curl -X GET "http://localhost:8000/api/v1/reps/1/stops?date=2026-10-18" \
+curl -X GET "http://127.0.0.1:8000/api/v1/reps/1/stops?date=2026-10-18" \
   -H "Accept: application/json"
 ```
 
-#### Example Response
+**Response (200 OK):**
 ```json
 {
   "rep_id": 1,
   "date": "2026-10-18",
   "stops": [
     {
-      "lat": 11.053891,
-      "lng": 76.073124,
+      "lat": 11.054012,
+      "lng": 76.073045,
       "started_at": "2026-10-18T10:30:00+00:00",
       "ended_at": "2026-10-18T10:55:00+00:00",
       "duration_minutes": 25,
@@ -244,19 +180,18 @@ curl -X GET "http://localhost:8000/api/v1/reps/1/stops?date=2026-10-18" \
 
 ---
 
-### 3. Retrieve Zone Dwell Time Report
-- **Endpoint**: `GET /api/v1/zones/reps?date=YYYY-MM-DD&coordinates=[[lat,lng],...]`
-- **Status Code**: `200 OK`
+### 3. Zone Dwell Time Report
+* **Method**: `GET`
+* **Route**: `/api/v1/zones/reps?date=YYYY-MM-DD&coordinates=[[lat,lng],...]`
+* **Status**: `200 OK`
 
-#### Example Request
 ```bash
-curl -G "http://localhost:8000/api/v1/zones/reps" \
+curl -G -H "Accept: application/json" "http://127.0.0.1:8000/api/v1/zones/reps" \
   --data-urlencode "date=2026-10-18" \
-  --data-urlencode 'coordinates=[[11.050,76.068],[11.058,76.068],[11.058,76.078],[11.050,76.078]]' \
-  -H "Accept: application/json"
+  --data-urlencode 'coordinates=[[11.050,76.068],[11.058,76.068],[11.058,76.078],[11.050,76.078]]'
 ```
 
-#### Example Response
+**Response (200 OK):**
 ```json
 {
   "data": [
@@ -278,110 +213,81 @@ curl -G "http://localhost:8000/api/v1/zones/reps" \
 
 ---
 
-### 4. Interactive Web Playback (Nice-to-Have)
-- **URL**: `http://localhost:8000/reps/1/day?date=2026-10-18`
-- Interactive Leaflet + OpenStreetMap interface displaying:
-  - Compressed polyline movement track.
-  - Numbered red stop markers with 50m radius circles and time popups.
-  - Interactive left-hand chronological timeline with automatic map fly-to focus upon click.
+### 4. Interactive Web Map & Timeline (Nice-to-Have)
+* **URL**: `http://127.0.0.1:8000/reps/1/day?date=2026-10-18`
+* Features:
+  * **Interactive Leaflet + OpenStreetMap** (no external API keys required).
+  * Rep track plotted with RDP-simplified polyline.
+  * Stop pins with 50-meter dashed boundary circles and duration popups.
+  * Left-side chronological shift timeline; clicking any timeline item automatically centers and zooms the map.
 
 ---
 
-## 6. Local Setup Instructions
+## Local Setup & Evaluation Instructions
 
 ### Prerequisites
 - PHP 8.2+ with `intl`, `pdo_mysql`, `sqlite3` extensions enabled.
 - Composer 2+
-- MySQL 8.0+ running locally (e.g. XAMPP, Docker, or native service).
+- MySQL 8.0+
 
-### Step-by-Step Installation
+### Setup Commands
+```bash
+# 1. Install dependencies
+composer install
 
-1. **Clone and Navigate to the Repository**:
-   ```bash
-   git clone <repo-url>
-   cd rep-tracker
-   ```
+# 2. Configure environment
+cp .env.example .env
+php artisan key:generate
 
-2. **Install PHP Dependencies**:
-   ```bash
-   composer install
-   ```
+# 3. Create the database in MySQL if not already existing:
+# mysql -u root -e "CREATE DATABASE rep_tracker CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
-3. **Configure Environment**:
-   ```bash
-   cp .env.example .env
-   php artisan key:generate
-   ```
-   Ensure your `.env` contains:
-   ```env
-   DB_CONNECTION=mysql
-   DB_HOST=127.0.0.1
-   DB_PORT=3306
-   DB_DATABASE=rep_tracker
-   DB_USERNAME=root
-   DB_PASSWORD=
-   QUEUE_CONNECTION=database
-   ```
+# 4. Migrate database and seed realistic demo tracking data
+php artisan migrate:fresh --seed
 
-4. **Prepare Database and Seed Realistic Demo Data**:
-   Ensure MySQL database `rep_tracker` exists (`CREATE DATABASE rep_tracker;`), then run:
-   ```bash
-   php artisan migrate:fresh --seed
-   ```
-   *(This migrates all tables, seeds 3 representatives, synthetic trajectories around Malappuram, and precomputed stops).*
+# 5. Start the background queue worker (in a separate terminal)
+php artisan queue:work
 
-5. **Start Queue Worker (in a separate terminal)**:
-   ```bash
-   php artisan queue:work
-   ```
+# 6. Start the local development server
+php artisan serve
+# Open http://localhost:8000 in your browser
+```
 
-6. **Start Local Development Server**:
-   ```bash
-   php artisan serve
-   ```
-   Access the web dashboard in your browser: [http://localhost:8000](http://localhost:8000).
+### Running Tests
+All unit and feature tests use in-memory SQLite and require no manual test database configuration:
+```bash
+php artisan test
+```
 
-7. **Run Test Suite**:
-   ```bash
-   php artisan test
-   ```
-   *(All 21 tests execute against SQLite in-memory, requiring zero setup and maintaining zero side-effects).*
+### Code Formatting (Laravel Pint)
+```bash
+./vendor/bin/pint --test
+```
 
-8. **Run Code Formatter (Laravel Pint)**:
-   ```bash
-   ./vendor/bin/pint --test
-   ```
-
----
-
-## 7. CLI Workday Simulator
-
-To generate a full day shift with realistic walking, stops, pauses, and signal gaps:
-
+### Generating Realistic Shifts (Artisan Simulator)
 ```bash
 php artisan tracking:simulate {rep_id_or_name} {YYYY-MM-DD}
-```
-Example:
-```bash
+
+# Example:
 php artisan tracking:simulate 1 2026-10-18
 ```
 
 ---
 
-## 8. Assumptions
+## Assumptions
 
-1. **Timestamps & Timezones**: All timestamps are ingested, stored, and computed in **UTC**. The denormalized `recorded_date` represents the UTC date.
-2. **Zone Representation**: Coordinates are supplied as an array of `[lat, lng]` pairs forming a polygon with at least 3 vertices.
-3. **Stationary Definition**: A sales representative is considered stationary if they stay within a **50-meter radius** of an anchor point for **15 minutes (900 seconds) or longer**.
+1. **UTC Standard**: All timestamps are ingested, stored, and calculated in **UTC**. The denormalized `recorded_date` represents the UTC date.
+2. **Zone Representation**: Coordinates are supplied as an array of at least 3 `[lat, lng]` pairs passed as a JSON query string.
+3. **Stationary Definition**: A representative is considered stationary if they stay within a **50-meter radius** of an anchor point for **15 minutes (900 seconds) or longer**.
 4. **Device Ping Interval**: Mobile devices are assumed to ping every 10–30 seconds.
-5. **Zone Outage Cap**: Consecutive points within a zone separated by more than 300 seconds are clamped to 300 seconds to prevent device battery depletion or tunnel signal loss from exaggerating on-site dwell time.
+5. **Outage Cap**: Consecutive points within a zone separated by more than 300 seconds are clamped to 300 seconds to prevent device power-off or tunnel signal loss from artificially exaggerating on-site dwell time.
 6. **Authentication**: Authentication is excluded from technical assessment scope per specification; `laravel/sanctum` is installed and ready for production API token issuance.
 
 ---
 
-## 9. Scaling & Future Enhancements
+## GitHub Collaborator Access
 
-1. **PostGIS / MySQL Spatial Indexes**: Transition coordinate storage to `POINT SRID 4326` with `ST_Contains()` and spatial R-Tree indexes for hardware-accelerated polygon clipping.
-2. **Redis Ingestion Buffer**: Place Redis in front of MySQL (`LPUSH` / Redis Stream) so mobile devices flush to in-memory buffers during peak morning check-ins, bulk-draining to MySQL in micro-batches.
-3. **Kafka / RabbitMQ Streaming**: Decouple stop computation and geofence alerting into high-throughput stream processors.
-4. **Partition Pruning**: Automatically roll out monthly/weekly partitions on `location_points` for near-instant archiving.
+Access to this private GitHub repository should be granted to:
+- `shansalam`
+- `hasiashiana`
+- `mnoufal369`
